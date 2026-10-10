@@ -1,0 +1,2529 @@
+--[[
+	Player Tweaks Panel  (compact / tabbed)
+	---------------------------------------
+	A LocalScript with a small draggable GUI split into four tabs (each page scrolls if it overflows):
+
+		MOVE    WalkSpeed, Jump, Fly + Fly Speed, Noclip, Fast Attack
+		VIEW    Field of View, Fullbright, ESP on other players
+		KEY     Object ESP: terms, scan rate, range, then
+		        Auto Move + delay, Go to nearest, Instant Prompt,
+		        Auto Rescue (rescue N NPCs then zipline out, loop)
+		OPT     Hotkeys, UI Scale (resize the panel), Unload
+
+	WHERE TO PUT IT:
+		StarterPlayer > StarterPlayerScripts   (recommended)
+		or StarterGui (as a LocalScript inside a ScreenGui)
+
+	HOTKEYS (all OFF by default - enable in the OPT tab):
+		RightShift  show / hide panel      N  noclip
+		F  fly (Space up, LeftCtrl down)   B  fullbright
+		V  player ESP                      K  key ESP
+		[ ]  narrow / wide FOV             Delete x2  unload script
+
+	Works on PC and mobile. Settings survive respawn.
+--]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+local TweenService = game:GetService("TweenService")
+local ProximityPromptService = game:GetService("ProximityPromptService")
+
+local player = Players.LocalPlayer
+
+--------------------------------------------------------------------
+-- SHUT DOWN A PREVIOUS RUN
+--   Executing this file twice used to stack a second panel on top of
+--   the first (the ScreenGui survives respawn), so an old build could
+--   still be the one on screen. Kill whatever is already running.
+--------------------------------------------------------------------
+
+do
+	-- Preferred path: the previous run left its own unloader behind, which
+	-- disconnects its loops and restores lighting / collisions properly.
+	local previous = rawget(_G, "PlayerTweaksUnload")
+	if type(previous) == "function" then
+		pcall(previous)
+	end
+
+	-- Fallback for executors that sandbox _G: at least remove the old UI
+	-- and the old range disc so nothing stale is left on screen.
+	local playerGui = player:WaitForChild("PlayerGui")
+	for _, obj in ipairs(playerGui:GetChildren()) do
+		if obj.Name == "PlayerTweaks" then
+			obj:Destroy()
+		end
+	end
+	for _, obj in ipairs(workspace:GetChildren()) do
+		if obj.Name == "SearchRangePreview" then
+			obj:Destroy()
+		end
+	end
+end
+
+--------------------------------------------------------------------
+-- STATE
+--------------------------------------------------------------------
+
+local DEFAULTS = {
+	WalkSpeed = 16,
+	JumpPower = 50,
+	JumpHeight = 7.2,
+	FOV = 70,
+	FlySpeed = 60,
+	AttackSpeed = 3, -- swing animation speed multiplier
+	KeyQuery = "redkey",
+	ScanInterval = 1,
+	MoveDelay = 2,
+	SearchRange = 0, -- studs; 0 means no limit
+	UIScale = 1.2, -- whole-panel zoom
+	RescueDelay = 1, -- seconds between each NPC rescue
+	DoorDelay = 3, -- seconds to wait after entering door (floor transition)
+	RescueCount = 0, -- 0 = rescue all NPCs, >0 = rescue up to N
+	ExitName = "zipline", -- name pattern for exit object after rescue
+	FloorDelay = 5, -- seconds to wait after going through door to next floor
+}
+
+local startCam = workspace.CurrentCamera
+
+local state = {
+	WalkSpeed = DEFAULTS.WalkSpeed,
+	JumpPower = DEFAULTS.JumpPower,
+	JumpHeight = DEFAULTS.JumpHeight,
+	FOV = startCam and startCam.FieldOfView or DEFAULTS.FOV,
+	FlySpeed = DEFAULTS.FlySpeed,
+	AttackSpeed = DEFAULTS.AttackSpeed,
+	Fly = false,
+	Noclip = false,
+	FastAttack = false,
+	Fullbright = false,
+	ESP = false,
+	KeyESP = false,
+	Hotkeys = false, -- master switch starts OFF; turn on in the OPT tab
+	AutoMove = false,
+	InstantPrompt = false,
+	AutoRescue = false, -- rescue loop
+	ScanInterval = DEFAULTS.ScanInterval, -- seconds between workspace sweeps
+	MoveDelay = DEFAULTS.MoveDelay, -- seconds between auto-move hops
+	SearchRange = DEFAULTS.SearchRange, -- studs; 0 means no limit
+	UIScale = DEFAULTS.UIScale, -- whole-panel zoom
+	RescueDelay = DEFAULTS.RescueDelay,
+	DoorDelay = DEFAULTS.DoorDelay,
+	RescueCount = DEFAULTS.RescueCount,
+	ExitName = DEFAULTS.ExitName,
+	FloorDelay = DEFAULTS.FloorDelay,
+}
+
+-- Key ESP search terms. A name matching ANY of these counts as a hit, so the
+-- box takes a comma separated list: "redkey, bluekey, card".
+local keyQueries = { DEFAULTS.KeyQuery }
+
+local hotkeyEnabled = {} -- filled in by the OPT tab; id -> boolean
+
+local rows = {} -- key -> refresh function, so Reset can repaint every number
+local originalCollide = {} -- BasePart -> original CanCollide
+
+-- Every connection made to a service (rather than to our own GUI) is kept here
+-- so Unload can shut the script down completely. GUI connections do not need
+-- tracking: gui:Destroy() drops them with the instances they belong to.
+local connections = {}
+
+local function bind(signal, fn)
+	local conn = signal:Connect(fn)
+	table.insert(connections, conn)
+	return conn
+end
+
+--------------------------------------------------------------------
+-- CHARACTER HELPERS
+--------------------------------------------------------------------
+
+local function getHumanoid()
+	local char = player.Character
+	return char and char:FindFirstChildOfClass("Humanoid") or nil
+end
+
+local function applyStats()
+	local hum = getHumanoid()
+	if not hum then
+		return
+	end
+
+	hum.WalkSpeed = state.WalkSpeed
+
+	-- Roblox has two jump systems; respect whichever the game uses.
+	if hum.UseJumpPower then
+		hum.JumpPower = state.JumpPower
+	else
+		hum.JumpHeight = state.JumpHeight
+	end
+end
+
+local function snapshotCollisions()
+	table.clear(originalCollide)
+	local char = player.Character
+	if not char then
+		return
+	end
+	for _, part in ipairs(char:GetDescendants()) do
+		if part:IsA("BasePart") then
+			originalCollide[part] = part.CanCollide
+		end
+	end
+end
+
+local function restoreCollisions()
+	for part, canCollide in pairs(originalCollide) do
+		if part.Parent then
+			part.CanCollide = canCollide
+		end
+	end
+	table.clear(originalCollide)
+end
+
+-- Noclip loop: keeps every character part non-colliding while enabled.
+bind(RunService.Stepped, function()
+	if not state.Noclip then
+		return
+	end
+	local char = player.Character
+	if not char then
+		return
+	end
+	for _, part in ipairs(char:GetDescendants()) do
+		if part:IsA("BasePart") and part.CanCollide then
+			if originalCollide[part] == nil then
+				originalCollide[part] = true
+			end
+			part.CanCollide = false
+		end
+	end
+end)
+
+bind(player.CharacterAdded, function(char)
+	char:WaitForChild("Humanoid")
+	task.wait(0.25)
+	applyStats()
+	if state.Noclip then
+		snapshotCollisions()
+	end
+end)
+
+--------------------------------------------------------------------
+-- UI THEME  (all sizing/font numbers live here)
+--------------------------------------------------------------------
+
+local THEME = {
+	bg = Color3.fromRGB(24, 26, 33),
+	panel = Color3.fromRGB(33, 36, 45),
+	stroke = Color3.fromRGB(58, 63, 77),
+	text = Color3.fromRGB(235, 238, 245),
+	muted = Color3.fromRGB(150, 157, 172),
+	accent = Color3.fromRGB(88, 140, 255),
+	on = Color3.fromRGB(56, 176, 108),
+	off = Color3.fromRGB(70, 74, 88),
+	key = Color3.fromRGB(255, 205, 60),
+	enemy = Color3.fromRGB(255, 78, 78),
+	ally = Color3.fromRGB(74, 210, 130),
+}
+
+local SIZE = {
+	panelW = 244,
+	panelH = 296,
+	pad = 8,
+	gap = 6,
+	titleH = 18,
+	tabH = 22,
+	pageH = 168,
+	rowH = 26,
+	hintH = 24,
+	resetH = 24,
+	labelW = 86,
+}
+
+local FONTSIZE = {
+	title = 13,
+	tab = 11,
+	label = 11,
+	value = 11,
+	toggle = 12,
+	hint = 10,
+	reset = 11,
+}
+
+local function corner(parent, radius)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, radius or 6)
+	c.Parent = parent
+	return c
+end
+
+local function stroke(parent, color, thickness)
+	local s = Instance.new("UIStroke")
+	s.Color = color or THEME.stroke
+	s.Thickness = thickness or 1
+	s.Parent = parent
+	return s
+end
+
+--------------------------------------------------------------------
+-- BUILD GUI SHELL
+--------------------------------------------------------------------
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "PlayerTweaks"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.IgnoreGuiInset = true
+gui.Parent = player:WaitForChild("PlayerGui")
+
+-- Small floating button that shows/hides the panel
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Name = "ToggleButton"
+toggleBtn.Size = UDim2.fromOffset(40, 40)
+toggleBtn.Position = UDim2.new(0, 14, 0, 90)
+toggleBtn.BackgroundColor3 = THEME.accent
+toggleBtn.Text = "\u{2699}"
+toggleBtn.TextSize = 20
+toggleBtn.TextColor3 = Color3.new(1, 1, 1)
+toggleBtn.Font = Enum.Font.GothamBold
+toggleBtn.AutoButtonColor = true
+toggleBtn.Parent = gui
+corner(toggleBtn, 20)
+
+local panel = Instance.new("Frame")
+panel.Name = "Panel"
+panel.Size = UDim2.fromOffset(SIZE.panelW, SIZE.panelH)
+panel.Position = UDim2.new(0, 64, 0, 90)
+panel.BackgroundColor3 = THEME.bg
+panel.BorderSizePixel = 0
+panel.Active = true
+panel.Visible = false
+panel.Parent = gui
+corner(panel, 10)
+stroke(panel)
+
+local layout = Instance.new("UIListLayout")
+layout.Padding = UDim.new(0, SIZE.gap)
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+layout.Parent = panel
+
+local padding = Instance.new("UIPadding")
+padding.PaddingTop = UDim.new(0, SIZE.pad)
+padding.PaddingBottom = UDim.new(0, SIZE.pad)
+padding.PaddingLeft = UDim.new(0, SIZE.pad)
+padding.PaddingRight = UDim.new(0, SIZE.pad)
+padding.Parent = panel
+
+-- Title bar (also the drag handle)
+local title = Instance.new("TextLabel")
+title.Name = "Title"
+title.LayoutOrder = 0
+title.Size = UDim2.new(1, 0, 0, SIZE.titleH)
+title.BackgroundTransparency = 1
+title.Text = "Player Tweaks"
+title.TextColor3 = THEME.text
+title.TextSize = FONTSIZE.title
+title.Font = Enum.Font.GothamBold
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = panel
+
+--------------------------------------------------------------------
+-- TABS
+--------------------------------------------------------------------
+
+local tabBar = Instance.new("Frame")
+tabBar.Name = "TabBar"
+tabBar.LayoutOrder = 1
+tabBar.Size = UDim2.new(1, 0, 0, SIZE.tabH)
+tabBar.BackgroundTransparency = 1
+tabBar.Parent = panel
+
+local tabLayout = Instance.new("UIListLayout")
+tabLayout.FillDirection = Enum.FillDirection.Horizontal
+tabLayout.Padding = UDim.new(0, 4)
+tabLayout.SortOrder = Enum.SortOrder.LayoutOrder
+tabLayout.Parent = tabBar
+
+local pageHolder = Instance.new("Frame")
+pageHolder.Name = "Pages"
+pageHolder.LayoutOrder = 2
+pageHolder.Size = UDim2.new(1, 0, 0, SIZE.pageH)
+pageHolder.BackgroundTransparency = 1
+pageHolder.ClipsDescendants = true
+pageHolder.Parent = panel
+
+local tabs = {} -- name -> { button = TextButton, page = Frame }
+
+local function selectTab(name)
+	for tabName, t in pairs(tabs) do
+		local selected = (tabName == name)
+		t.page.Visible = selected
+		t.button.BackgroundColor3 = selected and THEME.accent or THEME.panel
+		t.button.TextColor3 = selected and Color3.new(1, 1, 1) or THEME.muted
+	end
+end
+
+local function createTab(order, name)
+	local button = Instance.new("TextButton")
+	button.Name = name .. "Tab"
+	button.LayoutOrder = order
+	button.Size = UDim2.new(1 / 4, -3, 1, 0)
+	button.BackgroundColor3 = THEME.panel
+	button.Text = name
+	button.TextColor3 = THEME.muted
+	button.TextSize = FONTSIZE.tab
+	button.Font = Enum.Font.GothamBold
+	button.AutoButtonColor = false
+	button.Parent = tabBar
+	corner(button, 6)
+
+	local page = Instance.new("ScrollingFrame")
+	page.Name = name .. "Page"
+	page.Size = UDim2.fromScale(1, 1)
+	page.BackgroundTransparency = 1
+	page.BorderSizePixel = 0
+	page.ScrollingDirection = Enum.ScrollingDirection.Y
+	page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	page.CanvasSize = UDim2.new()
+	page.ScrollBarThickness = 3
+	page.ScrollBarImageColor3 = THEME.stroke
+	page.ScrollBarImageTransparency = 0.3
+	page.Visible = false
+	page.Parent = pageHolder
+
+	local pageList = Instance.new("UIListLayout")
+	pageList.Padding = UDim.new(0, SIZE.gap)
+	pageList.SortOrder = Enum.SortOrder.LayoutOrder
+	pageList.Parent = page
+
+	tabs[name] = { button = button, page = page }
+	button.Activated:Connect(function()
+		selectTab(name)
+	end)
+
+	return page
+end
+
+local movePage = createTab(1, "MOVE")
+local viewPage = createTab(2, "VIEW")
+local keyPage = createTab(3, "KEY")
+local optPage = createTab(4, "OPT")
+
+--------------------------------------------------------------------
+-- CONTROL BUILDERS
+--------------------------------------------------------------------
+
+-- One compact line:  label   [-] [ value ] [+]
+-- Returns a setter so hotkeys can drive the same value.
+local function numberRow(parent, order, labelText, key, min, max, step, decimals, onChanged)
+	local row = Instance.new("Frame")
+	row.Name = key .. "Row"
+	row.LayoutOrder = order
+	row.Size = UDim2.new(1, 0, 0, SIZE.rowH)
+	row.BackgroundColor3 = THEME.panel
+	row.BorderSizePixel = 0
+	row.Parent = parent
+	corner(row, 6)
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(0, SIZE.labelW, 1, 0)
+	label.Position = UDim2.fromOffset(6, 0)
+	label.BackgroundTransparency = 1
+	label.Text = labelText
+	label.TextColor3 = THEME.muted
+	label.TextSize = FONTSIZE.label
+	label.Font = Enum.Font.Gotham
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.Parent = row
+
+	local minus = Instance.new("TextButton")
+	minus.Size = UDim2.fromOffset(22, 20)
+	minus.Position = UDim2.fromOffset(SIZE.labelW + 6, 3)
+	minus.BackgroundColor3 = THEME.off
+	minus.Text = "-"
+	minus.TextColor3 = THEME.text
+	minus.TextSize = 15
+	minus.Font = Enum.Font.GothamBold
+	minus.Parent = row
+	corner(minus, 5)
+
+	local plus = Instance.new("TextButton")
+	plus.Size = UDim2.fromOffset(22, 20)
+	plus.Position = UDim2.new(1, -28, 0, 3)
+	plus.BackgroundColor3 = THEME.off
+	plus.Text = "+"
+	plus.TextColor3 = THEME.text
+	plus.TextSize = 15
+	plus.Font = Enum.Font.GothamBold
+	plus.Parent = row
+	corner(plus, 5)
+
+	local box = Instance.new("TextBox")
+	box.Size = UDim2.new(1, -(SIZE.labelW + 62), 0, 20)
+	box.Position = UDim2.fromOffset(SIZE.labelW + 32, 3)
+	box.BackgroundColor3 = THEME.bg
+	box.Text = ""
+	box.TextColor3 = THEME.text
+	box.TextSize = FONTSIZE.value
+	box.Font = Enum.Font.GothamMedium
+	box.ClearTextOnFocus = false
+	box.Parent = row
+	corner(box, 5)
+
+	local function refresh()
+		box.Text = string.format("%." .. tostring(decimals) .. "f", state[key])
+	end
+
+	local function setValue(v)
+		state[key] = math.clamp(v, min, max)
+		refresh()
+		if onChanged then
+			onChanged(state[key])
+		end
+	end
+
+	minus.Activated:Connect(function()
+		setValue(state[key] - step)
+	end)
+	plus.Activated:Connect(function()
+		setValue(state[key] + step)
+	end)
+	box.FocusLost:Connect(function()
+		local n = tonumber(box.Text)
+		if n then
+			setValue(n)
+		else
+			refresh()
+		end
+	end)
+
+	refresh()
+	rows[key] = refresh
+	return setValue
+end
+
+-- One compact line:  label   [ free text ]
+local function textRow(parent, order, labelText, initial, placeholder, onCommit)
+	local row = Instance.new("Frame")
+	row.Name = string.gsub(labelText, "%s", "") .. "Row"
+	row.LayoutOrder = order
+	row.Size = UDim2.new(1, 0, 0, SIZE.rowH)
+	row.BackgroundColor3 = THEME.panel
+	row.BorderSizePixel = 0
+	row.Parent = parent
+	corner(row, 6)
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(0, SIZE.labelW, 1, 0)
+	label.Position = UDim2.fromOffset(6, 0)
+	label.BackgroundTransparency = 1
+	label.Text = labelText
+	label.TextColor3 = THEME.muted
+	label.TextSize = FONTSIZE.label
+	label.Font = Enum.Font.Gotham
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.Parent = row
+
+	local box = Instance.new("TextBox")
+	box.Size = UDim2.new(1, -(SIZE.labelW + 12), 0, 20)
+	box.Position = UDim2.fromOffset(SIZE.labelW + 6, 3)
+	box.BackgroundColor3 = THEME.bg
+	box.Text = initial
+	box.PlaceholderText = placeholder
+	box.TextColor3 = THEME.text
+	box.TextSize = FONTSIZE.value
+	box.Font = Enum.Font.GothamMedium
+	box.ClearTextOnFocus = false
+	box.Parent = row
+	corner(box, 5)
+
+	box.FocusLost:Connect(function()
+		box.Text = onCommit(box.Text)
+	end)
+
+	return box
+end
+
+local function toggleButton(parent, order, labelText)
+	local btn = Instance.new("TextButton")
+	btn.Name = string.gsub(labelText, "%s", "") .. "Toggle"
+	btn.LayoutOrder = order
+	btn.Size = UDim2.new(1, 0, 0, SIZE.rowH)
+	btn.BackgroundColor3 = THEME.off
+	btn.Text = labelText .. ": OFF"
+	btn.TextColor3 = THEME.text
+	btn.TextSize = FONTSIZE.toggle
+	btn.Font = Enum.Font.GothamBold
+	btn.Parent = parent
+	corner(btn, 6)
+	return btn
+end
+
+local function paintToggle(btn, labelText, on)
+	btn.Text = labelText .. (on and ": ON" or ": OFF")
+	btn.BackgroundColor3 = on and THEME.on or THEME.off
+end
+
+--------------------------------------------------------------------
+-- MOVE TAB
+--------------------------------------------------------------------
+
+numberRow(movePage, 1, "Walk Speed", "WalkSpeed", 0, 500, 2, 0, applyStats)
+
+-- Show the jump control that matches this game's jump system.
+local startHum = getHumanoid()
+if (startHum == nil) or startHum.UseJumpPower then
+	numberRow(movePage, 2, "Jump Power", "JumpPower", 0, 500, 5, 0, applyStats)
+else
+	numberRow(movePage, 2, "Jump Height", "JumpHeight", 0, 100, 1, 1, applyStats)
+end
+
+--------------------------------------------------------------------
+-- MOVE TAB: FLY
+--   Horizontal steering comes from Humanoid.MoveDirection, so WASD and
+--   the mobile thumbstick both work and it is already camera-relative.
+--   Vertical is Space / LeftControl, or the on-screen pad on touch.
+--------------------------------------------------------------------
+
+local flyBtn = toggleButton(movePage, 3, "Fly")
+numberRow(movePage, 4, "Fly Speed", "FlySpeed", 5, 500, 10, 0, nil)
+
+local flyVelocity = nil -- BodyVelocity living on the HumanoidRootPart
+local flyUp, flyDown = false, false
+
+-- Small up/down pad, only shown while flying on a touch device.
+local flyPad = Instance.new("Frame")
+flyPad.Name = "FlyPad"
+flyPad.Size = UDim2.fromOffset(54, 116)
+flyPad.Position = UDim2.new(1, -70, 1, -200)
+flyPad.BackgroundTransparency = 1
+flyPad.Visible = false
+flyPad.Parent = gui
+
+local function padButton(text, y, setter)
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.fromOffset(54, 54)
+	btn.Position = UDim2.fromOffset(0, y)
+	btn.BackgroundColor3 = THEME.panel
+	btn.BackgroundTransparency = 0.2
+	btn.Text = text
+	btn.TextColor3 = THEME.text
+	btn.TextSize = 20
+	btn.Font = Enum.Font.GothamBold
+	btn.AutoButtonColor = true
+	btn.Parent = flyPad
+	corner(btn, 27)
+
+	local function held(input, value)
+		if
+			input.UserInputType == Enum.UserInputType.Touch
+			or input.UserInputType == Enum.UserInputType.MouseButton1
+		then
+			setter(value)
+		end
+	end
+
+	btn.InputBegan:Connect(function(input)
+		held(input, true)
+	end)
+	btn.InputEnded:Connect(function(input)
+		held(input, false)
+	end)
+end
+
+padButton("^", 0, function(v)
+	flyUp = v
+end)
+padButton("v", 62, function(v)
+	flyDown = v
+end)
+
+local function stopFly()
+	if flyVelocity then
+		flyVelocity:Destroy()
+		flyVelocity = nil
+	end
+	flyUp, flyDown = false, false
+end
+
+local function startFly()
+	stopFly()
+	local char = player.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not root then
+		return
+	end
+	local bv = Instance.new("BodyVelocity")
+	bv.Name = "FlyVelocity"
+	bv.MaxForce = Vector3.new(1, 1, 1) * 1e6
+	bv.P = 5000
+	bv.Velocity = Vector3.zero
+	bv.Parent = root
+	flyVelocity = bv
+end
+
+bind(RunService.RenderStepped, function()
+	if not state.Fly then
+		return
+	end
+
+	local char = player.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	local hum = getHumanoid()
+	if not root or not hum then
+		return
+	end
+
+	-- Rebuild after a respawn, or if the game stripped the mover.
+	if not flyVelocity or flyVelocity.Parent ~= root then
+		startFly()
+		if not flyVelocity then
+			return
+		end
+	end
+
+	local move = hum.MoveDirection -- world space, already camera-relative
+	local vertical = 0
+	if flyUp or UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+		vertical = vertical + 1
+	end
+	if flyDown or UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
+		vertical = vertical - 1
+	end
+
+	local dir = Vector3.new(move.X, vertical, move.Z)
+	if dir.Magnitude > 0 then
+		dir = dir.Unit
+	end
+	flyVelocity.Velocity = dir * state.FlySpeed
+end)
+
+local function setFly(on)
+	state.Fly = on
+	paintToggle(flyBtn, "Fly", on)
+	flyPad.Visible = on and UserInputService.TouchEnabled
+	if on then
+		startFly()
+	else
+		stopFly()
+	end
+end
+
+flyBtn.Activated:Connect(function()
+	setFly(not state.Fly)
+end)
+
+local noclipBtn = toggleButton(movePage, 5, "Noclip")
+
+local function setNoclip(on)
+	state.Noclip = on
+	paintToggle(noclipBtn, "Noclip", on)
+	if on then
+		snapshotCollisions()
+	else
+		restoreCollisions()
+	end
+end
+
+noclipBtn.Activated:Connect(function()
+	setNoclip(not state.Noclip)
+end)
+
+--------------------------------------------------------------------
+-- MOVE TAB: FAST ATTACK
+--   Plays your swing animations faster (tool swings, punches). A game
+--   that waits for the swing to finish before the next hit then hits
+--   faster too; one that uses its own cooldown or limits hits on the
+--   server does not change. Swings are the one-shot or Action-priority
+--   tracks, so looping walk / run / idle animations are left alone.
+--------------------------------------------------------------------
+
+local SWING_PRIORITY = {
+	[Enum.AnimationPriority.Action] = true,
+	[Enum.AnimationPriority.Action2] = true,
+	[Enum.AnimationPriority.Action3] = true,
+	[Enum.AnimationPriority.Action4] = true,
+}
+
+local spedTracks = {} -- AnimationTrack -> speed it had before we touched it
+local swingConn = nil -- AnimationPlayed on the current character's Animator
+
+local function isSwing(track)
+	return SWING_PRIORITY[track.Priority] == true or not track.Looped
+end
+
+local function speedUp(track)
+	if not isSwing(track) then
+		return
+	end
+	if spedTracks[track] == nil then
+		-- forget tracks that finished since the last swing
+		for old in pairs(spedTracks) do
+			if not old.IsPlaying then
+				spedTracks[old] = nil
+			end
+		end
+		spedTracks[track] = track.Speed
+	end
+	track:AdjustSpeed(state.AttackSpeed)
+end
+
+local fastBtn = toggleButton(movePage, 6, "Fast Attack")
+
+numberRow(movePage, 7, "Attack Speed", "AttackSpeed", 1, 10, 0.5, 1, function(value)
+	if state.FastAttack then
+		for track in pairs(spedTracks) do
+			if track.IsPlaying then
+				track:AdjustSpeed(value)
+			end
+		end
+	end
+end)
+
+local function setFastAttack(on)
+	state.FastAttack = on
+	paintToggle(fastBtn, "Fast Attack", on)
+	if on then
+		local hum = getHumanoid()
+		local animator = hum and hum:FindFirstChildOfClass("Animator")
+		if animator then
+			for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+				speedUp(track)
+			end
+		end
+	else
+		for track, speed in pairs(spedTracks) do
+			if track.IsPlaying then
+				track:AdjustSpeed(speed)
+			end
+		end
+		table.clear(spedTracks)
+	end
+end
+
+fastBtn.Activated:Connect(function()
+	setFastAttack(not state.FastAttack)
+end)
+
+-- Every animation the character starts passes through here, so a swing is
+-- sped up the moment it plays. Re-hooked on respawn (new Animator).
+local function hookAnimator(char)
+	if swingConn then
+		swingConn:Disconnect()
+		swingConn = nil
+	end
+	local hum = char and char:WaitForChild("Humanoid", 5)
+	local animator = hum and hum:WaitForChild("Animator", 5)
+	if not animator then
+		return
+	end
+	swingConn = bind(animator.AnimationPlayed, function(track)
+		if state.FastAttack then
+			speedUp(track)
+		end
+	end)
+end
+
+bind(player.CharacterAdded, hookAnimator)
+task.spawn(hookAnimator, player.Character)
+
+--------------------------------------------------------------------
+-- VIEW TAB: FIELD OF VIEW  (low = narrow / zoomed in, high = wide)
+--------------------------------------------------------------------
+
+local fovOverride = false -- flips true the moment the user touches FOV
+
+local setFOV = numberRow(viewPage, 1, "Field of View", "FOV", 1, 120, 5, 0, function()
+	fovOverride = true
+end)
+
+-- Hold the chosen FOV even if the game keeps writing its own.
+bind(RunService.RenderStepped, function()
+	if not fovOverride then
+		return
+	end
+	local cam = workspace.CurrentCamera
+	if cam and math.abs(cam.FieldOfView - state.FOV) > 0.01 then
+		cam.FieldOfView = state.FOV
+	end
+end)
+
+--------------------------------------------------------------------
+-- VIEW TAB: FULLBRIGHT
+--------------------------------------------------------------------
+
+local lightingBackup = nil -- saved once, restored when fullbright is turned off
+local atmosphereBackup = {} -- Atmosphere -> { Density, Haze, Glare }
+
+local FULLBRIGHT = {
+	Brightness = 3,
+	ClockTime = 14,
+	FogStart = 1e6,
+	FogEnd = 1e6,
+	GlobalShadows = false,
+	Ambient = Color3.new(1, 1, 1),
+	OutdoorAmbient = Color3.new(1, 1, 1),
+	ExposureCompensation = 0,
+}
+
+local function backupLighting()
+	if lightingBackup then
+		return
+	end
+	lightingBackup = {}
+	for prop in pairs(FULLBRIGHT) do
+		lightingBackup[prop] = Lighting[prop]
+	end
+	table.clear(atmosphereBackup)
+	for _, obj in ipairs(Lighting:GetChildren()) do
+		if obj:IsA("Atmosphere") then
+			atmosphereBackup[obj] = { obj.Density, obj.Haze, obj.Glare }
+		end
+	end
+end
+
+-- Called on a loop so a game with a day/night cycle cannot write the dark back.
+local function pushFullbright()
+	for prop, value in pairs(FULLBRIGHT) do
+		if Lighting[prop] ~= value then
+			Lighting[prop] = value
+		end
+	end
+	for _, obj in ipairs(Lighting:GetChildren()) do
+		if obj:IsA("Atmosphere") then
+			if atmosphereBackup[obj] == nil then
+				atmosphereBackup[obj] = { obj.Density, obj.Haze, obj.Glare }
+			end
+			obj.Density = 0
+			obj.Haze = 0
+			obj.Glare = 0
+		end
+	end
+end
+
+local function restoreLighting()
+	if lightingBackup then
+		for prop, value in pairs(lightingBackup) do
+			Lighting[prop] = value
+		end
+		lightingBackup = nil
+	end
+	for obj, saved in pairs(atmosphereBackup) do
+		if obj.Parent then
+			obj.Density, obj.Haze, obj.Glare = saved[1], saved[2], saved[3]
+		end
+	end
+	table.clear(atmosphereBackup)
+end
+
+local fullbrightBtn = toggleButton(viewPage, 2, "Fullbright")
+
+local function setFullbright(on)
+	state.Fullbright = on
+	paintToggle(fullbrightBtn, "Fullbright", on)
+	if on then
+		backupLighting()
+		pushFullbright()
+	else
+		restoreLighting()
+	end
+end
+
+fullbrightBtn.Activated:Connect(function()
+	setFullbright(not state.Fullbright)
+end)
+
+--------------------------------------------------------------------
+-- VIEW TAB: PLAYER ESP
+--------------------------------------------------------------------
+
+local espHolder = Instance.new("Folder")
+espHolder.Name = "ESPHolder"
+espHolder.Parent = gui
+
+local espObjects = {} -- Player -> { highlight, billboard, label }
+
+local function removeEsp(plr)
+	local o = espObjects[plr]
+	if not o then
+		return
+	end
+	if o.highlight then
+		o.highlight:Destroy()
+	end
+	if o.billboard then
+		o.billboard:Destroy()
+	end
+	espObjects[plr] = nil
+end
+
+local function clearEsp()
+	for plr in pairs(espObjects) do
+		removeEsp(plr)
+	end
+end
+
+local function espColor(plr)
+	if plr.Team and player.Team and plr.Team == player.Team then
+		return THEME.ally
+	end
+	return THEME.enemy
+end
+
+local function createEsp(plr)
+	local highlight = Instance.new("Highlight")
+	highlight.Name = "ESP_" .. plr.Name
+	highlight.FillTransparency = 0.65
+	highlight.OutlineTransparency = 0
+	highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	highlight.Parent = espHolder
+
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "Tag_" .. plr.Name
+	billboard.Size = UDim2.fromOffset(190, 30)
+	billboard.StudsOffset = Vector3.new(0, 2.6, 0)
+	billboard.AlwaysOnTop = true
+	billboard.MaxDistance = 5000
+	billboard.Parent = espHolder
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.fromScale(1, 1)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.GothamBold
+	label.TextSize = 12
+	label.TextStrokeTransparency = 0.4
+	label.TextStrokeColor3 = Color3.new(0, 0, 0)
+	label.Text = plr.Name
+	label.Parent = billboard
+
+	local o = { highlight = highlight, billboard = billboard, label = label }
+	espObjects[plr] = o
+	return o
+end
+
+local function updateEspFor(plr)
+	local char = plr.Character
+	local head = char and char:FindFirstChild("Head")
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not (char and head and hum) or hum.Health <= 0 then
+		removeEsp(plr)
+		return
+	end
+
+	local o = espObjects[plr] or createEsp(plr)
+	local color = espColor(plr)
+
+	if o.highlight.Adornee ~= char then
+		o.highlight.Adornee = char
+	end
+	if o.billboard.Adornee ~= head then
+		o.billboard.Adornee = head
+	end
+	o.highlight.FillColor = color
+	o.highlight.OutlineColor = color
+	o.label.TextColor3 = color
+
+	local myChar = player.Character
+	local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+	local distance = myRoot and (myRoot.Position - head.Position).Magnitude or 0
+
+	o.label.Text = string.format(
+		"%s  [%dm]\nHP %d / %d",
+		plr.Name,
+		math.floor(distance + 0.5),
+		math.floor(hum.Health + 0.5),
+		math.floor(hum.MaxHealth + 0.5)
+	)
+end
+
+bind(Players.PlayerRemoving, removeEsp)
+
+local espBtn = toggleButton(viewPage, 3, "ESP Players")
+
+local function setESP(on)
+	state.ESP = on
+	paintToggle(espBtn, "ESP Players", on)
+	if not on then
+		clearEsp()
+	end
+end
+
+espBtn.Activated:Connect(function()
+	setESP(not state.ESP)
+end)
+
+-- Fullbright refresh + player ESP refresh share one 0.1s tick.
+do
+	local clock = 0
+	bind(RunService.Heartbeat, function(dt)
+		clock = clock + dt
+		if clock < 0.1 then
+			return
+		end
+		clock = 0
+
+		if state.Fullbright then
+			pushFullbright()
+		end
+
+		if state.ESP then
+			for _, plr in ipairs(Players:GetPlayers()) do
+				if plr ~= player then
+					updateEspFor(plr)
+				end
+			end
+			for plr in pairs(espObjects) do
+				if plr.Parent == nil then
+					removeEsp(plr)
+				end
+			end
+		end
+	end)
+end
+
+--------------------------------------------------------------------
+-- KEY TAB: OBJECT ESP
+--------------------------------------------------------------------
+
+local keyObjects = {} -- Instance -> { highlight, billboard, label, part }
+local nearestKey = nil -- { part = BasePart, distance = number }
+
+local keyHolder = Instance.new("Folder")
+keyHolder.Name = "KeyESPHolder"
+keyHolder.Parent = gui
+
+-- A matching instance still needs a physical part to attach visuals to.
+local function anchorPart(inst)
+	if inst:IsA("BasePart") then
+		return inst
+	end
+	if inst:IsA("Tool") then
+		return inst:FindFirstChild("Handle") or inst:FindFirstChildWhichIsA("BasePart")
+	end
+	if inst:IsA("Model") then
+		return inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart", true)
+	end
+	return nil
+end
+
+local function isMine(inst)
+	local char = player.Character
+	local backpack = player:FindFirstChildOfClass("Backpack")
+	if char and inst:IsDescendantOf(char) then
+		return true
+	end
+	if backpack and inst:IsDescendantOf(backpack) then
+		return true
+	end
+	return false
+end
+
+local function removeKeyEsp(inst)
+	local o = keyObjects[inst]
+	if not o then
+		return
+	end
+	if o.highlight then
+		o.highlight:Destroy()
+	end
+	if o.billboard then
+		o.billboard:Destroy()
+	end
+	keyObjects[inst] = nil
+end
+
+local function clearKeyEsp()
+	for inst in pairs(keyObjects) do
+		removeKeyEsp(inst)
+	end
+	nearestKey = nil
+end
+
+local function createKeyEsp(inst, part)
+	local highlight = Instance.new("Highlight")
+	highlight.Name = "KeyESP"
+	highlight.Adornee = inst:IsA("Model") and inst or part
+	highlight.FillColor = THEME.key
+	highlight.OutlineColor = Color3.new(1, 1, 1)
+	highlight.FillTransparency = 0.35
+	highlight.OutlineTransparency = 0
+	highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	highlight.Parent = keyHolder
+
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "KeyTag"
+	billboard.Adornee = part
+	billboard.Size = UDim2.fromOffset(170, 26)
+	billboard.StudsOffset = Vector3.new(0, 2, 0)
+	billboard.AlwaysOnTop = true
+	billboard.MaxDistance = math.huge
+	billboard.Parent = keyHolder
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.fromScale(1, 1)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.GothamBold
+	label.TextSize = 13
+	label.TextColor3 = THEME.key
+	label.TextStrokeTransparency = 0.3
+	label.TextStrokeColor3 = Color3.new(0, 0, 0)
+	label.Text = inst.Name
+	label.Parent = billboard
+
+	local o = { highlight = highlight, billboard = billboard, label = label, part = part }
+	keyObjects[inst] = o
+	return o
+end
+
+-- "redkey, bluekey , Card" -> { "redkey", "bluekey", "card" }
+local function parseQueries(text)
+	local list, seen = {}, {}
+	for chunk in string.gmatch(string.lower(text or ""), "[^,]+") do
+		local word = string.match(chunk, "^%s*(.-)%s*$")
+		if word ~= "" and not seen[word] then
+			seen[word] = true
+			table.insert(list, word)
+		end
+	end
+	if #list == 0 then
+		list = { DEFAULTS.KeyQuery }
+	end
+	return list
+end
+
+local function matchesQuery(name)
+	local lower = string.lower(name)
+	for _, term in ipairs(keyQueries) do
+		if string.find(lower, term, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+-- Where distances are measured from: the character, or the camera before
+-- the character exists.
+local function measureOrigin()
+	local char = player.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if root then
+		return root.Position
+	end
+	local cam = workspace.CurrentCamera
+	return cam and cam.CFrame.Position or nil
+end
+
+-- Full workspace sweep. The expensive part, so it runs on its own timer.
+local function scanForKeys()
+	local found = {}
+	local origin = measureOrigin()
+	local range = state.SearchRange -- 0 = search the whole map
+
+	for _, inst in ipairs(workspace:GetDescendants()) do
+		if matchesQuery(inst.Name) and not isMine(inst) then
+			local part = anchorPart(inst)
+			local inRange = part ~= nil
+			if part and range > 0 and origin then
+				inRange = (part.Position - origin).Magnitude <= range
+			end
+			if part and inRange then
+				found[inst] = part
+				local o = keyObjects[inst]
+				if not o then
+					createKeyEsp(inst, part)
+				elseif o.part ~= part then
+					removeKeyEsp(inst)
+					createKeyEsp(inst, part)
+				end
+			end
+		end
+	end
+	-- forget anything that vanished, was renamed or got picked up by us
+	for inst in pairs(keyObjects) do
+		if found[inst] == nil or inst.Parent == nil then
+			removeKeyEsp(inst)
+		end
+	end
+end
+
+local function refreshKeyTags()
+	local myChar = player.Character
+	local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+	local cam = workspace.CurrentCamera
+	local origin = myRoot and myRoot.Position or (cam and cam.CFrame.Position)
+	if not origin then
+		return
+	end
+
+	local best, bestDist = nil, math.huge
+	for inst, o in pairs(keyObjects) do
+		local part = o.part
+		if part and part.Parent then
+			local dist = (part.Position - origin).Magnitude
+			o.label.Text = string.format("%s  [%dm]", inst.Name, math.floor(dist + 0.5))
+			if dist < bestDist then
+				best, bestDist = part, dist
+			end
+		else
+			removeKeyEsp(inst)
+		end
+	end
+
+	nearestKey = best and { part = best, distance = bestDist } or nil
+end
+
+-- HUD: distance + direction to the closest match
+local keyHud = Instance.new("TextLabel")
+keyHud.Name = "KeyHud"
+keyHud.Size = UDim2.fromOffset(280, 28)
+keyHud.Position = UDim2.new(0.5, -140, 0, 10)
+keyHud.BackgroundColor3 = Color3.new(0, 0, 0)
+keyHud.BackgroundTransparency = 0.45
+keyHud.Font = Enum.Font.GothamBold
+keyHud.TextSize = 15
+keyHud.TextColor3 = THEME.key
+keyHud.TextStrokeTransparency = 0.4
+keyHud.Text = ""
+keyHud.Visible = false
+keyHud.Parent = gui
+corner(keyHud, 6)
+
+local function updateKeyHud()
+	if not state.KeyESP then
+		keyHud.Visible = false
+		return
+	end
+	if not nearestKey then
+		-- Say why nothing showed up: wrong name, or nothing close enough.
+		if state.SearchRange > 0 then
+			keyHud.Text = string.format("KEY: nothing within %dm", state.SearchRange)
+		else
+			keyHud.Text = "KEY: nothing named  " .. table.concat(keyQueries, " / ")
+		end
+		keyHud.Visible = true
+		return
+	end
+
+	local cam = workspace.CurrentCamera
+	if not cam then
+		keyHud.Visible = false
+		return
+	end
+
+	local to = nearestKey.part.Position - cam.CFrame.Position
+	local flat = Vector3.new(to.X, 0, to.Z)
+	local arrow = "*"
+	if flat.Magnitude > 0.1 then
+		flat = flat.Unit
+		local look = cam.CFrame.LookVector
+		local right = cam.CFrame.RightVector
+		local lookFlat = Vector3.new(look.X, 0, look.Z)
+		local rightFlat = Vector3.new(right.X, 0, right.Z)
+		if lookFlat.Magnitude > 0.01 and rightFlat.Magnitude > 0.01 then
+			local angle = math.deg(math.atan2(rightFlat.Unit:Dot(flat), lookFlat.Unit:Dot(flat)))
+			local a = math.abs(angle)
+			if a <= 25 then
+				arrow = "^ AHEAD"
+			elseif a >= 155 then
+				arrow = "v BEHIND"
+			elseif angle > 0 then
+				arrow = "> RIGHT"
+			else
+				arrow = "< LEFT"
+			end
+		end
+	end
+
+	local up = ""
+	if to.Y > 6 then
+		up = "  (above)"
+	elseif to.Y < -6 then
+		up = "  (below)"
+	end
+
+	keyHud.Text = string.format("KEY  %dm   %s%s", math.floor(nearestKey.distance + 0.5), arrow, up)
+	keyHud.Visible = true
+end
+
+local keyBtn = toggleButton(keyPage, 1, "Key ESP")
+
+local function setKeyESP(on)
+	state.KeyESP = on
+	paintToggle(keyBtn, "Key ESP", on)
+	if on then
+		scanForKeys()
+		refreshKeyTags()
+		updateKeyHud()
+	else
+		clearKeyEsp()
+		keyHud.Visible = false
+	end
+end
+
+keyBtn.Activated:Connect(function()
+	setKeyESP(not state.KeyESP)
+end)
+
+-- What to look for. Comma separated: an object matching ANY term is shown.
+local queryBox = textRow(keyPage, 2, "Names", table.concat(keyQueries, ", "), "redkey, bluekey", function(text)
+	keyQueries = parseQueries(text)
+	clearKeyEsp()
+	if state.KeyESP then
+		scanForKeys()
+		refreshKeyTags()
+	end
+	return table.concat(keyQueries, ", ")
+end)
+
+-- How often the workspace sweep runs, in seconds.
+-- Lower = reacts faster, higher = cheaper on big maps.
+numberRow(keyPage, 3, "Scan (sec)", "ScanInterval", 0.1, 30, 0.5, 1, nil)
+
+--------------------------------------------------------------------
+-- RANGE PREVIEW
+--   A flat red disc on the ground showing how far the scan reaches.
+--   It appears whenever the range is changed and fades out after 3s.
+--   Roblox caps a part at 2048 studs per axis, which is why the Range
+--   row stops at 1000 (a 2000 stud wide disc); use 0 for the whole map.
+--------------------------------------------------------------------
+
+local RANGE_ALPHA = 0.85 -- resting transparency of the disc
+
+local rangeDisc = Instance.new("Part")
+rangeDisc.Name = "SearchRangePreview"
+rangeDisc.Shape = Enum.PartType.Cylinder
+rangeDisc.Size = Vector3.new(0.2, 2, 2)
+rangeDisc.Color = Color3.fromRGB(255, 55, 55)
+rangeDisc.Material = Enum.Material.Neon
+rangeDisc.Transparency = 1
+rangeDisc.Anchored = true
+rangeDisc.CanCollide = false
+rangeDisc.CanQuery = false
+rangeDisc.CanTouch = false
+rangeDisc.CastShadow = false
+rangeDisc.Parent = workspace
+
+local rangeVisible = false
+local rangeToken = 0 -- so an older hide timer cannot cut a newer preview short
+
+local function placeRangeDisc()
+	local origin = measureOrigin()
+	local radius = state.SearchRange
+	if not origin or radius <= 0 then
+		return false
+	end
+	rangeDisc.Size = Vector3.new(0.2, radius * 2, radius * 2)
+	-- A cylinder part runs along its X axis, so tip it up to lie flat.
+	rangeDisc.CFrame = CFrame.new(origin - Vector3.new(0, 2.6, 0))
+		* CFrame.Angles(0, 0, math.rad(90))
+	return true
+end
+
+local function hideRangeDisc(fade)
+	rangeVisible = false
+	if fade then
+		TweenService:Create(rangeDisc, TweenInfo.new(0.4), { Transparency = 1 }):Play()
+	else
+		rangeDisc.Transparency = 1
+	end
+end
+
+local function showRangePreview()
+	rangeToken = rangeToken + 1
+	local token = rangeToken
+
+	-- 0 means unlimited: there is no circle to draw.
+	if not placeRangeDisc() then
+		hideRangeDisc(false)
+		return
+	end
+
+	rangeVisible = true
+	rangeDisc.Transparency = RANGE_ALPHA
+
+	task.delay(3, function()
+		if token == rangeToken and rangeDisc.Parent then
+			hideRangeDisc(true)
+		end
+	end)
+end
+
+-- Keep the disc centred on the player for as long as it is showing.
+bind(RunService.RenderStepped, function()
+	if not rangeVisible then
+		return
+	end
+	if not placeRangeDisc() then
+		hideRangeDisc(false)
+	end
+end)
+
+-- How far to look, in studs. 0 searches the whole map. Anything outside the
+-- range is dropped from the scan, so it stops showing and Auto Move skips it.
+numberRow(keyPage, 4, "Range 0=all", "SearchRange", 0, 1000, 50, 0, function()
+	showRangePreview()
+	if state.KeyESP then
+		clearKeyEsp()
+		scanForKeys()
+		refreshKeyTags()
+	end
+end)
+
+--------------------------------------------------------------------
+-- KEY TAB: TRAVEL TO WHAT WAS FOUND
+--   Auto Move walks the list nearest-first, one hop per Move Delay.
+--   Objects already visited are skipped until nothing is left, then the
+--   list is reused, so a key that respawns is picked up again.
+--------------------------------------------------------------------
+
+local visited = {} -- Instance -> true, cleared when the list runs out
+local autoMoveGen = 0 -- guards against two loops running after a fast re-toggle
+
+local function teleportTo(position)
+	local char = player.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not root then
+		return false
+	end
+	local landing = position + Vector3.new(0, 3, 0)
+	-- keep facing roughly where the camera was pointing
+	root.CFrame = CFrame.new(landing, landing + root.CFrame.LookVector)
+	return true
+end
+
+local function nextTarget()
+	local myChar = player.Character
+	local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+	if not myRoot then
+		return nil
+	end
+
+	local best, bestDist = nil, math.huge
+	for inst, o in pairs(keyObjects) do
+		if not visited[inst] and o.part and o.part.Parent then
+			local dist = (o.part.Position - myRoot.Position).Magnitude
+			if dist < bestDist then
+				best, bestDist = inst, dist
+			end
+		end
+	end
+	return best
+end
+
+local autoMoveBtn = toggleButton(keyPage, 5, "Auto Move")
+
+numberRow(keyPage, 6, "Move (sec)", "MoveDelay", 0.1, 60, 0.5, 1, nil)
+
+local goBtn = Instance.new("TextButton")
+goBtn.Name = "GoToNearest"
+goBtn.LayoutOrder = 7
+goBtn.Size = UDim2.new(1, 0, 0, SIZE.rowH)
+goBtn.BackgroundColor3 = THEME.panel
+goBtn.Text = "Go to nearest"
+goBtn.TextColor3 = THEME.key
+goBtn.TextSize = FONTSIZE.toggle
+goBtn.Font = Enum.Font.GothamBold
+goBtn.Parent = keyPage
+corner(goBtn, 6)
+
+local function flashGo(text)
+	goBtn.Text = text
+	task.delay(1, function()
+		if goBtn.Parent then
+			goBtn.Text = "Go to nearest"
+		end
+	end)
+end
+
+goBtn.Activated:Connect(function()
+	if not state.KeyESP then
+		flashGo("turn Key ESP on first")
+		return
+	end
+	if not nearestKey then
+		flashGo("nothing found")
+		return
+	end
+	if teleportTo(nearestKey.part.Position) then
+		flashGo("moved")
+	end
+end)
+
+local function setAutoMove(on)
+	state.AutoMove = on
+	paintToggle(autoMoveBtn, "Auto Move", on)
+
+	autoMoveGen = autoMoveGen + 1
+	if not on then
+		return
+	end
+
+	-- Auto Move has nothing to aim at without the scanner running.
+	if not state.KeyESP then
+		setKeyESP(true)
+	end
+	table.clear(visited)
+
+	local generation = autoMoveGen
+	task.spawn(function()
+		while state.AutoMove and generation == autoMoveGen do
+			local target = nextTarget()
+			if target then
+				local o = keyObjects[target]
+				if o and o.part and o.part.Parent then
+					teleportTo(o.part.Position)
+				end
+				visited[target] = true
+			else
+				table.clear(visited) -- start the round again
+			end
+			task.wait(math.max(state.MoveDelay, 0.1))
+		end
+	end)
+end
+
+autoMoveBtn.Activated:Connect(function()
+	setAutoMove(not state.AutoMove)
+end)
+
+--------------------------------------------------------------------
+-- KEY TAB: INSTANT PROMPT
+--   Every hold-to-use prompt ("hold E to rescue") fires on the first
+--   press. Each prompt's own hold time is remembered and put back when
+--   this is turned off or the script unloads.
+--   Only the timer on our side is skipped: a game that times the hold
+--   on the server can still reject an instant press.
+--------------------------------------------------------------------
+
+local promptBackup = {} -- ProximityPrompt -> original HoldDuration
+
+local function makeInstant(prompt)
+	if prompt.HoldDuration <= 0 then
+		return
+	end
+	if promptBackup[prompt] == nil then
+		-- forget prompts destroyed since the last one (NPCs come and go)
+		for old in pairs(promptBackup) do
+			if old.Parent == nil then
+				promptBackup[old] = nil
+			end
+		end
+		promptBackup[prompt] = prompt.HoldDuration
+	end
+	prompt.HoldDuration = 0
+end
+
+local function restorePrompts()
+	for prompt, duration in pairs(promptBackup) do
+		if prompt.Parent then
+			prompt.HoldDuration = duration
+		end
+	end
+	table.clear(promptBackup)
+end
+
+local instantBtn = toggleButton(keyPage, 8, "Instant Prompt")
+
+local function setInstantPrompt(on)
+	state.InstantPrompt = on
+	paintToggle(instantBtn, "Instant Prompt", on)
+	if on then
+		for _, obj in ipairs(workspace:GetDescendants()) do
+			if obj:IsA("ProximityPrompt") then
+				makeInstant(obj)
+			end
+		end
+	else
+		restorePrompts()
+	end
+end
+
+instantBtn.Activated:Connect(function()
+	setInstantPrompt(not state.InstantPrompt)
+end)
+
+-- Prompts that appear later (a freshly spawned NPC) are caught as soon as
+-- they show up for us, and again when a hold starts in case the game has
+-- re-armed the timer in the meantime.
+local function onPrompt(prompt)
+	if state.InstantPrompt then
+		makeInstant(prompt)
+	end
+end
+
+bind(ProximityPromptService.PromptShown, onPrompt)
+bind(ProximityPromptService.PromptButtonHoldBegan, onPrompt)
+
+--------------------------------------------------------------------
+-- KEY TAB: AUTO RESCUE
+--   Automated rescue loop:
+--     1. Scan workspace for RescueNpc models
+--     2. Teleport to each one (nearest first)
+--     3. Fire its ProximityPrompt to rescue
+--     4. After all NPCs are rescued, find Door and teleport to it
+--     5. Wait for floor transition, then loop from step 1
+--
+--   Works with NPC naming pattern: RescueNpc_<id>_<floor>
+--   (e.g. RescueNpc_90601_3, RescueNpc_90702_3)
+--------------------------------------------------------------------
+
+-- Helper: fire a ProximityPrompt programmatically.
+-- Uses the executor's fireproximityprompt global when available.
+local function firePrompt(prompt)
+	local oldHold = prompt.HoldDuration
+	prompt.HoldDuration = 0
+
+	local ok = false
+	-- Most modern executors (Synapse, Fluxus, etc.) expose this global
+	if type(fireproximityprompt) == "function" then
+		ok = pcall(fireproximityprompt, prompt)
+	end
+	if not ok then
+		-- Fallback: try the internal method some executors allow
+		pcall(function()
+			prompt:InputHoldBegin()
+			task.wait(0.15)
+			prompt:InputHoldEnd()
+		end)
+	end
+
+	task.wait(0.15)
+	prompt.HoldDuration = oldHold
+end
+
+-- Scan workspace for all ProximityPrompts within `radius` studs of the
+-- player's current position and fire each one.  Returns true if any found.
+local function fireNearbyPrompts(radius)
+	local origin = measureOrigin()
+	if not origin then return false end
+	local found = false
+	for _, desc in ipairs(workspace:GetDescendants()) do
+		if desc:IsA("ProximityPrompt") then
+			local part = desc:FindFirstAncestorWhichIsA("BasePart")
+				or desc.Parent and desc.Parent:IsA("BasePart") and desc.Parent
+			if part then
+				local dist = (part.Position - origin).Magnitude
+				if dist <= radius then
+					firePrompt(desc)
+					found = true
+				end
+			end
+		end
+	end
+	return found
+end
+
+-- Search inside an instance (and its parent's children) for ProximityPrompts
+-- and fire each one. Returns true if at least one was found.
+local function firePromptsOn(inst)
+	local found = false
+
+	-- The instance itself
+	if inst:IsA("ProximityPrompt") then
+		firePrompt(inst)
+		found = true
+	end
+
+	-- Inside the instance and its descendants
+	for _, desc in ipairs(inst:GetDescendants()) do
+		if desc:IsA("ProximityPrompt") then
+			firePrompt(desc)
+			found = true
+		end
+	end
+
+	-- Sibling prompts (prompt might sit next to the NPC model, not inside it)
+	if not found and inst.Parent then
+		for _, child in ipairs(inst.Parent:GetChildren()) do
+			if child:IsA("ProximityPrompt") then
+				firePrompt(child)
+				found = true
+			end
+		end
+	end
+
+	return found
+end
+
+-- Separator label in the KEY tab
+local rescueHeader = Instance.new("TextLabel")
+rescueHeader.Name = "RescueHeader"
+rescueHeader.LayoutOrder = 9
+rescueHeader.Size = UDim2.new(1, 0, 0, 16)
+rescueHeader.BackgroundTransparency = 1
+rescueHeader.Text = "── Auto Rescue ──"
+rescueHeader.TextColor3 = THEME.accent
+rescueHeader.TextSize = 10
+rescueHeader.Font = Enum.Font.GothamBold
+rescueHeader.Parent = keyPage
+
+local autoRescueBtn = toggleButton(keyPage, 10, "Auto Rescue")
+
+numberRow(keyPage, 11, "Rescue #  0=all", "RescueCount", 0, 50, 1, 0, nil)
+numberRow(keyPage, 12, "Rescue (sec)", "RescueDelay", 0.1, 10, 0.5, 1, nil)
+numberRow(keyPage, 13, "Floor (sec)", "FloorDelay", 1, 30, 1, 0, nil)
+numberRow(keyPage, 14, "Exit (sec)", "DoorDelay", 0.5, 15, 0.5, 1, nil)
+
+-- What to teleport to after rescuing. Default "zipline" matches ZiplineBalconyAnchor.
+local exitBox = textRow(keyPage, 15, "Exit name", state.ExitName, "zipline", function(text)
+	local trimmed = string.match(text or "", "^%s*(.-)%s*$") or ""
+	if trimmed == "" then
+		trimmed = DEFAULTS.ExitName
+	end
+	state.ExitName = string.lower(trimmed)
+	return state.ExitName
+end)
+
+-- HUD: shows what Auto Rescue is currently doing
+local rescueHud = Instance.new("TextLabel")
+rescueHud.Name = "RescueHud"
+rescueHud.Size = UDim2.fromOffset(320, 28)
+rescueHud.Position = UDim2.new(0.5, -160, 0, 42)
+rescueHud.BackgroundColor3 = Color3.new(0, 0, 0)
+rescueHud.BackgroundTransparency = 0.45
+rescueHud.Font = Enum.Font.GothamBold
+rescueHud.TextSize = 14
+rescueHud.TextColor3 = THEME.ally
+rescueHud.TextStrokeTransparency = 0.4
+rescueHud.Text = ""
+rescueHud.Visible = false
+rescueHud.Parent = gui
+corner(rescueHud, 6)
+
+local autoRescueGen = 0
+
+local function setAutoRescue(on)
+	state.AutoRescue = on
+	paintToggle(autoRescueBtn, "Auto Rescue", on)
+	rescueHud.Visible = on
+
+	autoRescueGen = autoRescueGen + 1
+	if not on then
+		rescueHud.Visible = false
+		return
+	end
+
+	-- Turn on Instant Prompt so rescues happen on contact
+	if not state.InstantPrompt then
+		setInstantPrompt(true)
+	end
+
+	local generation = autoRescueGen
+	task.spawn(function()
+		while state.AutoRescue and generation == autoRescueGen do
+
+			-------------------------------------------------
+			-- Phase 1: rescue NPCs until quota is met
+			--   If RescueCount=5 but only 3 NPCs exist now,
+			--   rescue those 3, wait, rescan, rescue more
+			--   until total reaches 5. RescueCount=0 means
+			--   rescue ALL found in one scan pass.
+			-------------------------------------------------
+			local target = (state.RescueCount > 0) and state.RescueCount or 0
+			local rescued = 0
+			local rescuedSet = {} -- track instances already rescued
+
+			while state.AutoRescue and generation == autoRescueGen do
+				-- Scan for NPCs we haven't rescued yet
+				local npcs = {}
+				for _, inst in ipairs(workspace:GetDescendants()) do
+					if string.find(string.lower(inst.Name), "rescuenpc") then
+						if not rescuedSet[inst] then
+							local part = anchorPart(inst)
+							if part and not isMine(inst) then
+								table.insert(npcs, { instance = inst, part = part })
+							end
+						end
+					end
+				end
+
+				-- Sort nearest first
+				local origin = measureOrigin()
+				if origin then
+					table.sort(npcs, function(a, b)
+						return (a.part.Position - origin).Magnitude
+							 < (b.part.Position - origin).Magnitude
+					end)
+				end
+
+				-- How many to rescue this pass
+				local remaining
+				if target > 0 then
+					remaining = target - rescued
+				else
+					remaining = #npcs -- 0=all: rescue everything found
+				end
+
+				rescueHud.Text = string.format(
+					"RESCUE: %d done, found %d new, need %s",
+					rescued, #npcs,
+					target > 0 and tostring(target) or "all"
+				)
+				rescueHud.TextColor3 = THEME.ally
+				rescueHud.Visible = true
+
+				-- Quota already met → move on to zipline
+				if target > 0 and rescued >= target then
+					break
+				end
+				-- 0=all mode and no NPCs left → move on to zipline
+				if target == 0 and #npcs == 0 then
+					break
+				end
+
+				if #npcs == 0 and target > 0 and rescued < target then
+					----------------------------------------------
+					-- No NPCs on this floor but quota not met
+					-- → go to Door to advance to next floor
+					----------------------------------------------
+					rescueHud.Text = string.format(
+						"RESCUE: %d/%d — no NPCs, going to Door...",
+						rescued, target
+					)
+					rescueHud.TextColor3 = THEME.key
+
+					origin = measureOrigin()
+					local doors = {}
+					for _, inst in ipairs(workspace:GetDescendants()) do
+						-- Match instances named exactly "Door" that have DoorHpUi
+						-- anywhere inside them (recursive search)
+						if string.lower(inst.Name) == "door"
+							and inst:FindFirstChild("DoorHpUi", true) then
+							local part = anchorPart(inst)
+								or inst:FindFirstChildWhichIsA("BasePart", true)
+							-- Only pick doors ABOVE the player (next floor up)
+							if part and origin and part.Position.Y > origin.Y then
+								table.insert(doors, { instance = inst, part = part })
+							end
+						end
+					end
+					if origin and #doors > 0 then
+						table.sort(doors, function(a, b)
+							return (a.part.Position - origin).Magnitude
+								 < (b.part.Position - origin).Magnitude
+						end)
+					end
+
+					if #doors > 0 and doors[1].part and doors[1].part.Parent then
+						local doorInst = doors[1].instance
+						local doorDist = origin and math.floor((doors[1].part.Position - origin).Magnitude) or 0
+						rescueHud.Text = string.format(
+							"FLOOR: → %s [%dm] (%d found, %d/%d rescued)",
+							doorInst.Name, doorDist, #doors, rescued, target
+						)
+						local doorPos = doors[1].part.Position
+						local char = player.Character
+						local root = char and char:FindFirstChild("HumanoidRootPart")
+
+						-- Calculate direction toward door
+						local dirToDoor
+						if root then
+							dirToDoor = (doorPos - root.Position)
+							dirToDoor = Vector3.new(dirToDoor.X, 0, dirToDoor.Z)
+							if dirToDoor.Magnitude > 0.01 then
+								dirToDoor = dirToDoor.Unit
+							else
+								dirToDoor = root.CFrame.LookVector
+							end
+							-- Teleport to 3 studs in front of door, facing it
+							local standPos = doorPos - dirToDoor * 3 + Vector3.new(0, 3, 0)
+							root.CFrame = CFrame.new(standPos, doorPos)
+						end
+						task.wait(0.3)
+
+						-- Phase A: attack the door until DoorHpUi disappears
+						local attackStart = tick()
+						local maxAttackTime = 30 -- timeout after 30s
+						while doorInst:FindFirstChild("DoorHpUi", true)
+							and state.AutoRescue
+							and generation == autoRescueGen
+							and (tick() - attackStart) < maxAttackTime do
+
+							rescueHud.Text = string.format(
+								"DOOR: attacking %s...", doorInst.Name
+							)
+							-- Fire prompts on door and nearby
+							firePromptsOn(doorInst)
+							fireNearbyPrompts(10)
+							task.wait(0.5)
+
+							-- Wiggle in front of the door to keep attacking
+							if root and root.Parent and dirToDoor then
+								local nearPos = doorPos - dirToDoor * 2.5 + Vector3.new(0, 3, 0)
+								local farPos  = doorPos - dirToDoor * 4 + Vector3.new(0, 3, 0)
+								root.CFrame = CFrame.new(nearPos, doorPos)
+								task.wait(0.3)
+								root.CFrame = CFrame.new(farPos, doorPos)
+								task.wait(0.3)
+							end
+						end
+
+						-- Phase B: door broken → walk through into the room
+						if not doorInst:FindFirstChild("DoorHpUi", true) then
+							rescueHud.Text = string.format(
+								"DOOR: %s broken! entering room...", doorInst.Name
+							)
+							teleportTo(doorPos)
+							task.wait(0.5)
+							-- Move a bit past the door to get inside
+							if root and root.Parent and dirToDoor then
+								local insidePos = doorPos + dirToDoor * 5 + Vector3.new(0, 3, 0)
+								root.CFrame = CFrame.new(insidePos, insidePos + dirToDoor)
+							end
+							task.wait(0.3)
+						end
+					else
+						-- Count all "Door" instances for debug
+						local allDoors = 0
+						local doorsWithHp = 0
+						for _, inst in ipairs(workspace:GetDescendants()) do
+							if string.lower(inst.Name) == "door" then
+								allDoors = allDoors + 1
+								if inst:FindFirstChild("DoorHpUi", true) then
+									doorsWithHp = doorsWithHp + 1
+								end
+							end
+						end
+						rescueHud.Text = string.format(
+							"RESCUE: no Door above — total:%d withHP:%d",
+							allDoors, doorsWithHp
+						)
+					end
+
+					-- Wait for new floor to load
+					rescueHud.Text = string.format(
+						"FLOOR: waiting %ds for next floor... (%d/%d)",
+						state.FloorDelay, rescued, target
+					)
+					task.wait(math.max(state.FloorDelay, 1))
+				else
+					-- Rescue NPCs this pass
+					local count = 0
+					for _, npc in ipairs(npcs) do
+						if count >= remaining then break end
+						if not state.AutoRescue or generation ~= autoRescueGen then
+							break
+						end
+						if npc.part and npc.part.Parent and npc.instance.Parent then
+							rescued = rescued + 1
+							rescuedSet[npc.instance] = true
+							rescueHud.Text = string.format(
+								"RESCUE: %d/%s  →  %s",
+								rescued,
+								target > 0 and tostring(target) or "all",
+								npc.instance.Name
+							)
+							teleportTo(npc.part.Position)
+							task.wait(0.3)
+							firePromptsOn(npc.instance)
+							count = count + 1
+							task.wait(math.max(state.RescueDelay, 0.1))
+						end
+					end
+
+					-- After rescuing this batch, check quota
+					if target > 0 and rescued >= target then
+						break -- quota met → zipline
+					end
+					if target == 0 then
+						break -- 0=all mode, one pass done → zipline
+					end
+
+					-- Still need more → short wait then rescan same floor
+					task.wait(math.max(state.RescueDelay, 0.5))
+				end
+			end
+
+			if not state.AutoRescue or generation ~= autoRescueGen then
+				break
+			end
+
+			-------------------------------------------------
+			-- Phase 2: go to the nearest exit object
+			--   Default "zipline" matches ZiplineBalconyAnchor
+			-------------------------------------------------
+			local exitSearch = state.ExitName
+			rescueHud.Text = string.format("RESCUE: done %d → finding %s...", rescued, exitSearch)
+			rescueHud.TextColor3 = THEME.key
+			task.wait(0.5)
+
+			origin = measureOrigin() -- refresh after teleports
+			local exits = {}
+			for _, inst in ipairs(workspace:GetDescendants()) do
+				if string.find(string.lower(inst.Name), exitSearch, 1, true) then
+					local part = anchorPart(inst)
+					if part then
+						table.insert(exits, { instance = inst, part = part })
+					end
+				end
+			end
+
+			if origin and #exits > 0 then
+				table.sort(exits, function(a, b)
+					return (a.part.Position - origin).Magnitude
+						 < (b.part.Position - origin).Magnitude
+				end)
+			end
+
+			if #exits > 0 and exits[1].part and exits[1].part.Parent then
+				rescueHud.Text = string.format("EXIT: → %s", exits[1].instance.Name)
+				teleportTo(exits[1].part.Position)
+				task.wait(0.3)
+				local fired = firePromptsOn(exits[1].instance)
+				if not fired then
+					-- Fallback: scan for any ProximityPrompt within 15 studs
+					task.wait(0.2)
+					fireNearbyPrompts(15)
+				end
+			else
+				rescueHud.Text = string.format("RESCUE: no '%s' found, retrying...", exitSearch)
+			end
+
+			-- Turn off after reaching zipline so user can inspect
+			rescueHud.Text = string.format("RESCUE: done %d — stopped.", rescued)
+			setAutoRescue(false)
+			break
+		end
+
+		-- Loop ended
+		if rescueHud.Parent then
+			rescueHud.Visible = false
+		end
+	end)
+end
+
+autoRescueBtn.Activated:Connect(function()
+	setAutoRescue(not state.AutoRescue)
+end)
+
+--------------------------------------------------------------------
+-- KEY ESP LOOP (user-set scan rate + fixed 0.1s tag/HUD refresh)
+--------------------------------------------------------------------
+
+do
+	local scanClock, tagClock = 0, 0
+	bind(RunService.Heartbeat, function(dt)
+		if not state.KeyESP then
+			return
+		end
+
+		scanClock = scanClock + dt
+		if scanClock >= state.ScanInterval then
+			scanClock = 0
+			scanForKeys()
+		end
+
+		tagClock = tagClock + dt
+		if tagClock >= 0.1 then
+			tagClock = 0
+			refreshKeyTags()
+			updateKeyHud()
+		end
+	end)
+end
+
+--------------------------------------------------------------------
+-- FOOTER: hotkey hint + reset
+--------------------------------------------------------------------
+
+local hint = Instance.new("TextLabel")
+hint.Name = "Hotkeys"
+hint.LayoutOrder = 3
+hint.Size = UDim2.new(1, 0, 0, SIZE.hintH)
+hint.BackgroundTransparency = 1
+hint.Text = "RShift panel | F fly | N noclip\nB bright | V esp | K key | [ ] fov"
+hint.TextColor3 = THEME.muted
+hint.TextSize = FONTSIZE.hint
+hint.Font = Enum.Font.Gotham
+hint.TextXAlignment = Enum.TextXAlignment.Left
+hint.Parent = panel
+
+local resetBtn = Instance.new("TextButton")
+resetBtn.Name = "Reset"
+resetBtn.LayoutOrder = 4
+resetBtn.Size = UDim2.new(1, 0, 0, SIZE.resetH)
+resetBtn.BackgroundColor3 = THEME.panel
+resetBtn.Text = "Reset to default"
+resetBtn.TextColor3 = THEME.muted
+resetBtn.TextSize = FONTSIZE.reset
+resetBtn.Font = Enum.Font.Gotham
+resetBtn.Parent = panel
+corner(resetBtn, 6)
+
+resetBtn.Activated:Connect(function()
+	state.WalkSpeed = DEFAULTS.WalkSpeed
+	state.JumpPower = DEFAULTS.JumpPower
+	state.JumpHeight = DEFAULTS.JumpHeight
+	state.ScanInterval = DEFAULTS.ScanInterval
+	state.MoveDelay = DEFAULTS.MoveDelay
+	state.SearchRange = DEFAULTS.SearchRange
+	state.FlySpeed = DEFAULTS.FlySpeed
+	state.AttackSpeed = DEFAULTS.AttackSpeed
+	state.RescueDelay = DEFAULTS.RescueDelay
+	state.DoorDelay = DEFAULTS.DoorDelay
+	state.RescueCount = DEFAULTS.RescueCount
+	state.ExitName = DEFAULTS.ExitName
+	state.FloorDelay = DEFAULTS.FloorDelay
+
+	setAutoRescue(false)
+	setAutoMove(false)
+	setFly(false)
+	setNoclip(false)
+	setFastAttack(false)
+	setFullbright(false)
+	setESP(false)
+	setKeyESP(false)
+	setInstantPrompt(false)
+
+	fovOverride = false
+	state.FOV = DEFAULTS.FOV
+	local cam = workspace.CurrentCamera
+	if cam then
+		cam.FieldOfView = DEFAULTS.FOV
+	end
+
+	keyQueries = { DEFAULTS.KeyQuery }
+	queryBox.Text = DEFAULTS.KeyQuery
+	exitBox.Text = DEFAULTS.ExitName
+
+	for _, refresh in pairs(rows) do
+		refresh()
+	end
+	applyStats()
+end)
+
+--------------------------------------------------------------------
+-- OPT TAB: HOTKEYS
+--   A master switch plus one chip per binding, so a key that clashes
+--   with the game (F, V, K...) can be switched off on its own.
+--------------------------------------------------------------------
+
+local HOTKEYS = {
+	{ id = "Panel", chip = "RShift menu", codes = { Enum.KeyCode.RightShift } },
+	{ id = "Fly", chip = "F fly", codes = { Enum.KeyCode.F } },
+	{ id = "Noclip", chip = "N noclip", codes = { Enum.KeyCode.N } },
+	{ id = "Fullbright", chip = "B bright", codes = { Enum.KeyCode.B } },
+	{ id = "ESP", chip = "V esp", codes = { Enum.KeyCode.V } },
+	{ id = "KeyESP", chip = "K key", codes = { Enum.KeyCode.K } },
+	{ id = "FOV", chip = "[ ] fov", codes = { Enum.KeyCode.LeftBracket, Enum.KeyCode.RightBracket } },
+	{ id = "Unload", chip = "Del unload", codes = { Enum.KeyCode.Delete } },
+}
+
+for _, binding in ipairs(HOTKEYS) do
+	hotkeyEnabled[binding.id] = true
+end
+
+local hotkeyMasterBtn = toggleButton(optPage, 1, "Hotkeys")
+
+local hotkeyNote = Instance.new("TextLabel")
+hotkeyNote.Name = "HotkeyNote"
+hotkeyNote.LayoutOrder = 2
+hotkeyNote.Size = UDim2.new(1, 0, 0, 14)
+hotkeyNote.BackgroundTransparency = 1
+hotkeyNote.Text = "tap a key to turn it on / off"
+hotkeyNote.TextColor3 = THEME.muted
+hotkeyNote.TextSize = 9
+hotkeyNote.Font = Enum.Font.Gotham
+hotkeyNote.TextXAlignment = Enum.TextXAlignment.Left
+hotkeyNote.Parent = optPage
+
+local chipHolder = Instance.new("Frame")
+chipHolder.Name = "HotkeyChips"
+chipHolder.LayoutOrder = 3
+chipHolder.Size = UDim2.new(1, 0, 0, 84)
+chipHolder.BackgroundTransparency = 1
+chipHolder.Parent = optPage
+
+local chipGrid = Instance.new("UIGridLayout")
+chipGrid.CellSize = UDim2.new(1 / 3, -3, 0, 24)
+chipGrid.CellPadding = UDim2.fromOffset(4, 4)
+chipGrid.SortOrder = Enum.SortOrder.LayoutOrder
+chipGrid.Parent = chipHolder
+
+local chips = {} -- id -> TextButton
+
+local function paintChip(binding)
+	local chip = chips[binding.id]
+	if not chip then
+		return
+	end
+	local live = state.Hotkeys and hotkeyEnabled[binding.id]
+	chip.BackgroundColor3 = live and THEME.on or THEME.off
+	chip.TextColor3 = live and Color3.new(1, 1, 1) or THEME.muted
+end
+
+local function paintAllChips()
+	for _, binding in ipairs(HOTKEYS) do
+		paintChip(binding)
+	end
+end
+
+for order, binding in ipairs(HOTKEYS) do
+	local chip = Instance.new("TextButton")
+	chip.Name = binding.id .. "Chip"
+	chip.LayoutOrder = order
+	chip.BackgroundColor3 = THEME.on
+	chip.Text = binding.chip
+	chip.TextColor3 = Color3.new(1, 1, 1)
+	chip.TextSize = 10
+	chip.Font = Enum.Font.GothamBold
+	chip.AutoButtonColor = false
+	chip.Parent = chipHolder
+	corner(chip, 5)
+
+	chips[binding.id] = chip
+	chip.Activated:Connect(function()
+		hotkeyEnabled[binding.id] = not hotkeyEnabled[binding.id]
+		paintChip(binding)
+	end)
+end
+
+local HOTKEY_HINT_ON = "RShift menu, F fly, N noclip, B bright,\nV esp, K key, [ ] fov, Del x2 unload"
+local HOTKEY_HINT_OFF = "Hotkeys are OFF\nenable them in the OPT tab"
+
+local function setHotkeys(on)
+	state.Hotkeys = on
+	paintToggle(hotkeyMasterBtn, "Hotkeys", on)
+	paintAllChips()
+	hint.Text = on and HOTKEY_HINT_ON or HOTKEY_HINT_OFF
+end
+
+hotkeyMasterBtn.Activated:Connect(function()
+	setHotkeys(not state.Hotkeys)
+end)
+
+-- Reset turns every binding back on (the footer button was wired up earlier).
+resetBtn.Activated:Connect(function()
+	for _, binding in ipairs(HOTKEYS) do
+		hotkeyEnabled[binding.id] = true
+	end
+	setHotkeys(false) -- default is off
+end)
+
+setHotkeys(state.Hotkeys)
+
+--------------------------------------------------------------------
+-- OPT TAB: UI SCALE
+--   One UIScale on the panel blows up the whole thing - rows, buttons
+--   and text together - so the panel can be made comfortable on a big
+--   monitor without every size in the theme table being retuned.
+--------------------------------------------------------------------
+
+local uiScale = Instance.new("UIScale")
+uiScale.Name = "PanelScale"
+uiScale.Scale = state.UIScale
+uiScale.Parent = panel
+
+local setUIScale = numberRow(optPage, 4, "UI Scale", "UIScale", 0.6, 3, 0.1, 1, function(value)
+	uiScale.Scale = value
+end)
+
+-- Quick -/+ in the title bar, so resizing does not mean digging into a tab.
+local function scaleButton(text, xOffset, delta)
+	local btn = Instance.new("TextButton")
+	btn.Name = "Scale" .. (delta > 0 and "Up" or "Down")
+	btn.Size = UDim2.fromOffset(18, 16)
+	btn.Position = UDim2.new(1, xOffset, 0, 1)
+	btn.BackgroundColor3 = THEME.panel
+	btn.Text = text
+	btn.TextColor3 = THEME.muted
+	btn.TextSize = 12
+	btn.Font = Enum.Font.GothamBold
+	btn.Parent = title
+	corner(btn, 4)
+
+	btn.Activated:Connect(function()
+		setUIScale(state.UIScale + delta)
+	end)
+end
+
+scaleButton("-", -42, -0.1)
+scaleButton("+", -20, 0.1)
+
+resetBtn.Activated:Connect(function()
+	setUIScale(DEFAULTS.UIScale)
+end)
+
+--------------------------------------------------------------------
+-- UNLOAD: put the game back the way it was and remove the script
+--------------------------------------------------------------------
+
+local unloadBtn = Instance.new("TextButton")
+unloadBtn.Name = "Unload"
+unloadBtn.LayoutOrder = 5
+unloadBtn.Size = UDim2.new(1, 0, 0, SIZE.rowH)
+unloadBtn.BackgroundColor3 = THEME.panel
+unloadBtn.Text = "Unload script"
+unloadBtn.TextColor3 = THEME.enemy
+unloadBtn.TextSize = FONTSIZE.toggle
+unloadBtn.Font = Enum.Font.GothamBold
+unloadBtn.Parent = optPage
+corner(unloadBtn, 6)
+
+local unloadArmed = false
+local unloadToken = 0
+
+-- Two taps required, so a stray click or Delete press cannot wipe the panel.
+local function armUnload()
+	unloadArmed = true
+	unloadToken = unloadToken + 1
+	unloadBtn.Text = "Tap again to unload"
+	unloadBtn.BackgroundColor3 = THEME.enemy
+	unloadBtn.TextColor3 = Color3.new(1, 1, 1)
+
+	local token = unloadToken
+	task.delay(3, function()
+		if unloadArmed and unloadToken == token then
+			unloadArmed = false
+			unloadBtn.Text = "Unload script"
+			unloadBtn.BackgroundColor3 = THEME.panel
+			unloadBtn.TextColor3 = THEME.enemy
+		end
+	end)
+end
+
+local function unloadScript()
+	-- 1. switch every feature off through its own setter, which restores
+	--    lighting, collisions, highlights, prompt hold times, swing speed
+	--    and the fly mover.
+	setAutoRescue(false)
+	setAutoMove(false)
+	setFly(false)
+	setNoclip(false)
+	setFastAttack(false)
+	setFullbright(false)
+	setESP(false)
+	setKeyESP(false)
+	setInstantPrompt(false)
+
+	-- 2. hand the camera back to the game
+	if fovOverride then
+		fovOverride = false
+		local cam = workspace.CurrentCamera
+		if cam then
+			cam.FieldOfView = DEFAULTS.FOV
+		end
+	end
+
+	-- 3. normal movement stats again
+	state.WalkSpeed = DEFAULTS.WalkSpeed
+	state.JumpPower = DEFAULTS.JumpPower
+	state.JumpHeight = DEFAULTS.JumpHeight
+	applyStats()
+
+	-- 4. stop every service loop, then delete the interface
+	for _, conn in ipairs(connections) do
+		if conn.Connected then
+			conn:Disconnect()
+		end
+	end
+	table.clear(connections)
+
+	_G.PlayerTweaksUnload = nil
+	rangeDisc:Destroy()
+	gui:Destroy()
+	print("[Player Tweaks] unloaded")
+end
+
+-- Let a future run of this file shut this one down cleanly.
+_G.PlayerTweaksUnload = unloadScript
+
+local function pressUnload()
+	if unloadArmed then
+		unloadScript()
+	else
+		armUnload()
+	end
+end
+
+unloadBtn.Activated:Connect(pressUnload)
+
+--------------------------------------------------------------------
+-- HOTKEY DISPATCH
+--------------------------------------------------------------------
+
+local function hotkeyActive(id)
+	return state.Hotkeys and hotkeyEnabled[id]
+end
+
+bind(UserInputService.InputBegan, function(input, processed)
+	if processed or not state.Hotkeys or UserInputService:GetFocusedTextBox() then
+		return
+	end
+
+	local code = input.KeyCode
+	if code == Enum.KeyCode.RightShift and hotkeyActive("Panel") then
+		panel.Visible = not panel.Visible
+	elseif code == Enum.KeyCode.F and hotkeyActive("Fly") then
+		setFly(not state.Fly)
+	elseif code == Enum.KeyCode.N and hotkeyActive("Noclip") then
+		setNoclip(not state.Noclip)
+	elseif code == Enum.KeyCode.B and hotkeyActive("Fullbright") then
+		setFullbright(not state.Fullbright)
+	elseif code == Enum.KeyCode.V and hotkeyActive("ESP") then
+		setESP(not state.ESP)
+	elseif code == Enum.KeyCode.K and hotkeyActive("KeyESP") then
+		setKeyESP(not state.KeyESP)
+	elseif code == Enum.KeyCode.LeftBracket and hotkeyActive("FOV") then
+		setFOV(state.FOV - 5)
+	elseif code == Enum.KeyCode.RightBracket and hotkeyActive("FOV") then
+		setFOV(state.FOV + 5)
+	elseif code == Enum.KeyCode.Delete and hotkeyActive("Unload") then
+		pressUnload()
+	end
+end)
+
+--------------------------------------------------------------------
+-- SHOW / HIDE + DRAGGING (mouse and touch)
+--------------------------------------------------------------------
+
+toggleBtn.Activated:Connect(function()
+	panel.Visible = not panel.Visible
+end)
+
+do
+	local dragging, dragStart, startPos = false, nil, nil
+
+	local function beginDrag(input)
+		dragging = true
+		dragStart = input.Position
+		startPos = panel.Position
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				dragging = false
+			end
+		end)
+	end
+
+	title.InputBegan:Connect(function(input)
+		if
+			input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch
+		then
+			beginDrag(input)
+		end
+	end)
+
+	bind(UserInputService.InputChanged, function(input)
+		if not dragging then
+			return
+		end
+		if
+			input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch
+		then
+			local delta = input.Position - dragStart
+			panel.Position = UDim2.new(
+				startPos.X.Scale,
+				startPos.X.Offset + delta.X,
+				startPos.Y.Scale,
+				startPos.Y.Offset + delta.Y
+			)
+		end
+	end)
+end
+
+selectTab("MOVE")
+applyStats()
